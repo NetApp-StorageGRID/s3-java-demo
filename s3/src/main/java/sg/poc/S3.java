@@ -10,9 +10,12 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -24,8 +27,12 @@ import java.util.concurrent.ThreadFactory;
 import java.util.stream.Collectors;
 
 import com.amazonaws.SDKGlobalConfiguration;
+import com.amazonaws.auth.profile.ProfileCredentialsProvider;
 import com.amazonaws.client.builder.ExecutorFactory;
 import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration;
+import com.amazonaws.regions.AwsRegionProvider;
+import com.amazonaws.regions.AwsSystemPropertyRegionProvider;
+import com.amazonaws.regions.DefaultAwsRegionProviderChain;
 import com.amazonaws.services.s3.model.Tag;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
@@ -42,6 +49,7 @@ import com.amazonaws.services.s3.model.PutObjectRequest;
 import com.amazonaws.services.s3.model.S3Object;
 import com.amazonaws.services.s3.model.S3ObjectInputStream;
 import com.amazonaws.services.s3.model.S3ObjectSummary;
+import com.amazonaws.services.s3.model.SetBucketPolicyRequest;
 import com.amazonaws.services.s3.model.SetObjectTaggingRequest;
 import com.amazonaws.services.s3.model.DeleteObjectsRequest.KeyVersion;
 import com.amazonaws.services.s3.transfer.TransferManager;
@@ -85,8 +93,10 @@ public final class S3 {
     private boolean insecure = false;
     @Parameter(names = { "--keep-files", "-k" }, description = "Keep upload source and download destination files")
     private boolean keepFiles = false;
+    @Parameter(names = { "--profile" }, description = "AWS Profile to be used")
+    private String profileName = "";
     @Parameter(names = { "--region", "-r" }, description = "AWS Region to be used")
-    private String region = "us-east-1";
+    private String region = "";
     @Parameter(names = { "--skip-validation", "-sv" }, description = "Skip MD5 validation of uploads and downloads")
     private boolean skipValidation = false;
     @Parameter(names = { "--debug", "-d" }, description = "Enable debug level logging")
@@ -148,14 +158,19 @@ public final class S3 {
             System.setProperty(SDKGlobalConfiguration.DISABLE_CERT_CHECKING_SYSTEM_PROPERTY, "true");
         }
 
-        if (!endpoint.isEmpty()) {
-            logger.info("Setting up AWS SDK S3 Client using endpoint " + endpoint + " and region " + region);
-            s3Client = AmazonS3ClientBuilder.standard().withPathStyleAccessEnabled(true)
-                    .withEndpointConfiguration(new EndpointConfiguration(endpoint, region)).build();
-        } else {
-            logger.info("Setting up AWS SDK S3 Client using AWS endpoint and region ");
-            s3Client = AmazonS3ClientBuilder.standard().withRegion(region).build();
+        AmazonS3ClientBuilder s3ClientBuilder = AmazonS3ClientBuilder.standard();
+        if (!profileName.isEmpty()) {
+            logger.info("Setting up AWS SDK S3 Client using AWS Profile " + profileName);
+            s3ClientBuilder.withCredentials(new ProfileCredentialsProvider(profileName));
         }
+        if (!endpoint.isEmpty()) {
+            if (region.isEmpty()) {
+                region = s3ClientBuilder.getRegion();
+            }
+            logger.info("Setting up AWS SDK S3 Client using endpoint " + endpoint);
+            s3ClientBuilder.withEndpointConfiguration(new EndpointConfiguration(endpoint, region));
+        }
+        s3Client = s3ClientBuilder.build();
 
         // S3 allows max part size of 5GB, calculating partSize so that every processor
         // core gets 1 thread
@@ -238,7 +253,7 @@ public final class S3 {
         S3Object downloadObject = s3Client.getObject(bucketName, "my-object");
         S3ObjectInputStream inputStream = downloadObject.getObjectContent();
 
-        File destinationFile = createFile(sizeInMb,tempFileDirectoryPath);
+        File destinationFile = createFile(sizeInMb, tempFileDirectoryPath);
         logger.info("Path to destination file: " + destinationFile.getAbsolutePath());
 
         // copy object to file and calculate MD5 sum while copying
@@ -254,8 +269,7 @@ public final class S3 {
             outputStream.close();
         } catch (java.security.NoSuchAlgorithmException noSuchAlgorithmException) {
             noSuchAlgorithmException.printStackTrace();
-        }
-        finally {
+        } finally {
             // delete destination file
             if (!keepFiles) {
                 destinationFile.delete();
@@ -267,7 +281,8 @@ public final class S3 {
         transferManager.download(getObjectRequest, destinationFile);
 
         logger.info("Listing objects");
-        ListObjectsV2Request listObjectsV2Request = new ListObjectsV2Request().withMaxKeys(5).withBucketName(bucketName);
+        ListObjectsV2Request listObjectsV2Request = new ListObjectsV2Request().withMaxKeys(5)
+                .withBucketName(bucketName);
         ListObjectsV2Result listObjectsV2Result = s3Client.listObjectsV2(listObjectsV2Request);
         int keyCount = listObjectsV2Result.getKeyCount();
         List<S3ObjectSummary> objects = listObjectsV2Result.getObjectSummaries();
@@ -304,7 +319,7 @@ public final class S3 {
         logger.info("Get object tags");
         GetObjectTaggingRequest getObjectTaggingRequest = new GetObjectTaggingRequest(bucketName, "my-object");
         GetObjectTaggingResult getObjectTaggingResult = s3Client.getObjectTagging(getObjectTaggingRequest);
-        getObjectTaggingResult.getTagSet().forEach((tag) -> System.out.println(tag.getKey() + " => " +  tag.getValue()));
+        getObjectTaggingResult.getTagSet().forEach((tag) -> System.out.println(tag.getKey() + " => " + tag.getValue()));
 
         logger.info("Delete all objects in bucket " + bucketName + " using Multi-Object Delete");
         while (objects.size() > 0) {
@@ -319,15 +334,20 @@ public final class S3 {
             s3Client.deleteObjects(deleteObjectsRequest);
         }
 
+        logger.info("Setting public read only bucket policy");
+        String policyPublicReadOnly = "{  \"Statement\": [    {      \"Effect\": \"Allow\",      \"Principal\": \"*\",      \"Action\": [        \"s3:GetObject\",        \"s3:ListBucket\"      ],      \"Resource\": [        \"urn:sgws:s3:::website-bucket\",        \"urn:sgws:s3:::website-bucket/*\"      ]    }  ]}";
+        SetBucketPolicyRequest setBucketPolicyRequest = new SetBucketPolicyRequest(bucketName, policyPublicReadOnly);
+        s3Client.setBucketPolicy(setBucketPolicyRequest);
+
         logger.info("Delete bucket " + bucketName);
         s3Client.deleteBucket(bucketName);
 
         logger.info("Finished");
     }
 
-    private void cleanup() {
+    private void cleanup() throws IOException {
         logger.info("Deleting temp file directory " + tempFileDirectoryPath);
-        /* Files.walkFileTree(tempFileDirectoryPath, new SimpleFileVisitor<Path>() {
+        Files.walkFileTree(tempFileDirectoryPath, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes basicFileAttributes) throws IOException {
                 Files.delete(file);
@@ -339,10 +359,13 @@ public final class S3 {
                 Files.delete(dir);
                 return FileVisitResult.CONTINUE;
             }
-        }); */
+        });
 
         // shutdown Transfer Manager to release threads
         transferManager.shutdownNow();
+
+        // shutdown S3 Client
+        s3Client.shutdown();
     }
 
     /**
