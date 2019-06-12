@@ -1,24 +1,20 @@
 package sg.poc;
 
-import org.apache.commons.codec.binary.Hex;
-
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.net.URL;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.security.DigestInputStream;
-import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -26,18 +22,21 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.stream.Collectors;
 
+import com.amazonaws.HttpMethod;
 import com.amazonaws.SDKGlobalConfiguration;
 import com.amazonaws.auth.profile.ProfileCredentialsProvider;
 import com.amazonaws.client.builder.ExecutorFactory;
 import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration;
-import com.amazonaws.regions.AwsRegionProvider;
-import com.amazonaws.regions.AwsSystemPropertyRegionProvider;
-import com.amazonaws.regions.DefaultAwsRegionProviderChain;
 import com.amazonaws.services.s3.model.Tag;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.model.Bucket;
+import com.amazonaws.services.s3.model.CopyObjectRequest;
+import com.amazonaws.services.s3.model.CreateBucketRequest;
+import com.amazonaws.services.s3.model.DeleteBucketRequest;
+import com.amazonaws.services.s3.model.DeleteObjectRequest;
 import com.amazonaws.services.s3.model.DeleteObjectsRequest;
+import com.amazonaws.services.s3.model.GeneratePresignedUrlRequest;
 import com.amazonaws.services.s3.model.GetObjectRequest;
 import com.amazonaws.services.s3.model.GetObjectTaggingRequest;
 import com.amazonaws.services.s3.model.GetObjectTaggingResult;
@@ -46,15 +45,11 @@ import com.amazonaws.services.s3.model.ListObjectsV2Result;
 import com.amazonaws.services.s3.model.ObjectMetadata;
 import com.amazonaws.services.s3.model.ObjectTagging;
 import com.amazonaws.services.s3.model.PutObjectRequest;
-import com.amazonaws.services.s3.model.S3Object;
-import com.amazonaws.services.s3.model.S3ObjectInputStream;
 import com.amazonaws.services.s3.model.S3ObjectSummary;
-import com.amazonaws.services.s3.model.SetBucketPolicyRequest;
 import com.amazonaws.services.s3.model.SetObjectTaggingRequest;
 import com.amazonaws.services.s3.model.DeleteObjectsRequest.KeyVersion;
 import com.amazonaws.services.s3.transfer.TransferManager;
 import com.amazonaws.services.s3.transfer.TransferManagerBuilder;
-import com.amazonaws.util.IOUtils;
 import com.amazonaws.util.StringUtils;
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
@@ -78,9 +73,6 @@ public final class S3 {
 
     // setup logging
     private final static Logger logger = Logger.getLogger(S3.class);
-
-    // set number of processors
-    private final static int numberOfProcessors = Runtime.getRuntime().availableProcessors();
 
     /*
      * CLI Parameters
@@ -154,7 +146,7 @@ public final class S3 {
         }
 
         if (insecure) {
-            logger.info("Disabling certificate check");
+            logger.info("Disabling SSL certificate check, not recommended for production!");
             System.setProperty(SDKGlobalConfiguration.DISABLE_CERT_CHECKING_SYSTEM_PROPERTY, "true");
         }
 
@@ -172,18 +164,8 @@ public final class S3 {
         }
         s3Client = s3ClientBuilder.build();
 
-        // S3 allows max part size of 5GB, calculating partSize so that every processor
-        // core gets 1 thread
-        if (sizeInMb / (long) numberOfProcessors > 5 * GB) {
-            partSize = 5 * GB;
-        } else if (sizeInMb / numberOfProcessors < 5 * MB) {
-            partSize = 5 * MB;
-        } else {
-            partSize = sizeInMb * MB / numberOfProcessors;
-        }
-
-        // create a new executor factory to enable multi-threaded uploads with one
-        // thread per processor
+        // not required, but showing what is possible when using your own executor
+        // factory
         ExecutorFactory executorFactory = new ExecutorFactory() {
             public ExecutorService newExecutor() {
                 ThreadFactory threadFactory = new ThreadFactory() {
@@ -195,16 +177,18 @@ public final class S3 {
                         return thread;
                     }
                 };
+                int numberOfProcessors = Runtime.getRuntime().availableProcessors();
                 return Executors.newFixedThreadPool(numberOfProcessors, threadFactory);
             }
         };
 
-        // create a Transfer Manager for managing S3 uploads and downloads with the AWS
-        // SDK High-Level API
-        logger.info("Number of processors: " + numberOfProcessors);
-        transferManager = TransferManagerBuilder.standard().withExecutorFactory(executorFactory).withS3Client(s3Client)
-                .withMinimumUploadPartSize(partSize).withMultipartUploadThreshold(partSize).build();
-        logger.info("Part size: " + partSize);
+        // create a Transfer Manager for managing S3 uploads and downloads with the
+        // High-Level API
+        TransferManagerBuilder transferManagerBuilder = TransferManagerBuilder.standard();
+        transferManagerBuilder.withExecutorFactory(executorFactory).withS3Client(s3Client);
+        transferManagerBuilder.withMultipartCopyThreshold(512 * MB);
+        transferManagerBuilder.withMinimumUploadPartSize(128 * MB);
+        transferManager = transferManagerBuilder.build();
 
         if (!StringUtils.isNullOrEmpty(tempFileDirectory)) {
             tempFileDirectoryPath = Paths.get(tempFileDirectory);
@@ -217,14 +201,17 @@ public final class S3 {
         bucketName = UUID.randomUUID().toString();
         logger.info("Using random bucket name" + bucketName);
 
-        logger.info("Creating sample file of size " + sizeInMb + "MB");
-        file = createFile(sizeInMb, tempFileDirectoryPath);
-
+        file = Files.createTempFile(tempFileDirectoryPath, "s3-", ".dat").toFile();
+        RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw");
+        randomAccessFile.setLength(sizeInMb * MB);
+        randomAccessFile.close();
+        logger.info("Created temporary file " + file + " of size " + sizeInMb + "MB");
     }
 
     private void run() throws IOException {
         logger.info("Creating bucket " + bucketName);
-        s3Client.createBucket(bucketName);
+        CreateBucketRequest createBucketRequest = new CreateBucketRequest(bucketName);
+        s3Client.createBucket(createBucketRequest);
 
         logger.info("Listing all buckets");
         List<Bucket> buckets = s3Client.listBuckets();
@@ -236,59 +223,40 @@ public final class S3 {
         s3Client.putObject(bucketName, "my-object", "Hello World!");
 
         logger.info("Copy an existing object");
-        s3Client.copyObject(bucketName, "my-object", bucketName, "my-object-copy");
+        CopyObjectRequest copyObjectRequest = new CopyObjectRequest(bucketName, "my-object", bucketName,
+                "my-object-copy");
+        s3Client.copyObject(copyObjectRequest);
 
         logger.info("Upload object from file");
-        s3Client.putObject(bucketName, "my-object", file);
+        PutObjectRequest putObjectRequest = new PutObjectRequest(bucketName, "my-object", file);
+        s3Client.putObject(putObjectRequest);
 
-        logger.info("Write object using transferManager");
-        transferManager.upload(bucketName, "my-object", file);
+        logger.info("Upload object from file using transferManager");
+        transferManager.upload(putObjectRequest);
 
-        logger.info("Create 10 empty objects with prefix folder/");
-        for (int i = 1; i <= 10; i++) {
-            s3Client.putObject(bucketName, "folder/" + i, "");
-        }
+        logger.info("Upload all files of directory using transferManager and prefix object keys with my-directory/");
+        putObjectRequest = new PutObjectRequest(bucketName, "my-object", file);
+        transferManager.uploadDirectory(bucketName, "my-directory", tempFileDirectoryPath.toFile(), true);
 
         logger.info("Read object");
-        S3Object downloadObject = s3Client.getObject(bucketName, "my-object");
-        S3ObjectInputStream inputStream = downloadObject.getObjectContent();
-
-        File destinationFile = createFile(sizeInMb, tempFileDirectoryPath);
-        logger.info("Path to destination file: " + destinationFile.getAbsolutePath());
-
-        // copy object to file and calculate MD5 sum while copying
-        try {
-            // create temporary File to save download to
-            OutputStream outputStream = new FileOutputStream(destinationFile);
-            MessageDigest messageDigest = MessageDigest.getInstance("MD5");
-            DigestInputStream digestInputStream = new DigestInputStream(inputStream, messageDigest);
-            IOUtils.copy(digestInputStream, outputStream);
-            String md5sum = Hex.encodeHexString(messageDigest.digest());
-            logger.info("MD5 sum of destination file: " + md5sum);
-            inputStream.close();
-            outputStream.close();
-        } catch (java.security.NoSuchAlgorithmException noSuchAlgorithmException) {
-            noSuchAlgorithmException.printStackTrace();
-        } finally {
-            // delete destination file
-            if (!keepFiles) {
-                destinationFile.delete();
-            }
-        }
+        GetObjectRequest getObjectRequest = new GetObjectRequest(bucketName, "my-object");
+        File destinationFile = Files.createTempFile(tempFileDirectoryPath, "s3-", ".dat").toFile();
+        s3Client.getObject(getObjectRequest, destinationFile);
 
         logger.info("Download file using transfer manager");
-        GetObjectRequest getObjectRequest = new GetObjectRequest(bucketName, "my-object");
+        getObjectRequest = new GetObjectRequest(bucketName, "my-object");
         transferManager.download(getObjectRequest, destinationFile);
 
         logger.info("Listing objects");
-        ListObjectsV2Request listObjectsV2Request = new ListObjectsV2Request().withMaxKeys(5)
-                .withBucketName(bucketName);
+        ListObjectsV2Request listObjectsV2Request = new ListObjectsV2Request().withBucketName(bucketName);
+        // withMaxKeys is usually not required (default is 1000), just used to
+        // demonstrate trunking
+        listObjectsV2Request.withMaxKeys(1);
         ListObjectsV2Result listObjectsV2Result = s3Client.listObjectsV2(listObjectsV2Request);
-        int keyCount = listObjectsV2Result.getKeyCount();
         List<S3ObjectSummary> objects = listObjectsV2Result.getObjectSummaries();
-        logger.info("Retrieved " + keyCount + " objects");
+        logger.info("Retrieved " + listObjectsV2Result.getKeyCount() + " objects");
         while (listObjectsV2Result.isTruncated()) {
-            logger.info("result is truncated, therefore we need to fetch additional objects");
+            logger.info("Result is truncated, therefore we need to fetch additional objects");
             listObjectsV2Request.withContinuationToken(listObjectsV2Result.getNextContinuationToken());
             listObjectsV2Result = s3Client.listObjectsV2(listObjectsV2Request);
             objects.addAll(listObjectsV2Result.getObjectSummaries());
@@ -296,7 +264,7 @@ public final class S3 {
         objects.forEach((object) -> System.out.println(object.getKey()));
 
         logger.info("Write object with custom metadata");
-        PutObjectRequest putObjectRequest = new PutObjectRequest(bucketName, "my-object", file);
+        putObjectRequest = new PutObjectRequest(bucketName, "my-object", file);
         ObjectMetadata metadata = new ObjectMetadata();
         metadata.addUserMetadata("company", "NetApp");
         metadata.addUserMetadata("location", "Europe");
@@ -321,11 +289,23 @@ public final class S3 {
         GetObjectTaggingResult getObjectTaggingResult = s3Client.getObjectTagging(getObjectTaggingRequest);
         getObjectTaggingResult.getTagSet().forEach((tag) -> System.out.println(tag.getKey() + " => " + tag.getValue()));
 
-        logger.info("Delete all objects in bucket " + bucketName + " using Multi-Object Delete");
+        logger.info("Creating presigned URL");
+        GeneratePresignedUrlRequest generatePresignedUrl = new GeneratePresignedUrlRequest(bucketName, "my-object",
+                HttpMethod.GET);
+        Date expiration = new Date(System.currentTimeMillis() - 3600 * 1000);
+        generatePresignedUrl.withExpiration(expiration);
+        URL presignedUrl = s3Client.generatePresignedUrl(generatePresignedUrl);
+        logger.info("Presigned URL: " + presignedUrl);
+
+        logger.info("Delete individual object");
+        DeleteObjectRequest deleteObjectRequest = new DeleteObjectRequest(bucketName, "my-object");
+        s3Client.deleteObject(deleteObjectRequest);
+
+        logger.info("Delete all objects in bucket " + bucketName
+                + " using Multi-Object Delete using previously retrieved object list");
         while (objects.size() > 0) {
             DeleteObjectsRequest deleteObjectsRequest = new DeleteObjectsRequest(bucketName);
             List<S3ObjectSummary> objectsToDelete = objects.subList(0, Math.min(objects.size(), 1000));
-            ;
             List<KeyVersion> objectKeysToDelete = objectsToDelete.stream()
                     .map(objectSummary -> new DeleteObjectsRequest.KeyVersion(objectSummary.getKey()))
                     .collect(Collectors.toList());
@@ -334,13 +314,18 @@ public final class S3 {
             s3Client.deleteObjects(deleteObjectsRequest);
         }
 
-        logger.info("Setting public read only bucket policy");
-        String policyPublicReadOnly = "{  \"Statement\": [    {      \"Effect\": \"Allow\",      \"Principal\": \"*\",      \"Action\": [        \"s3:GetObject\",        \"s3:ListBucket\"      ],      \"Resource\": [        \"urn:sgws:s3:::website-bucket\",        \"urn:sgws:s3:::website-bucket/*\"      ]    }  ]}";
-        SetBucketPolicyRequest setBucketPolicyRequest = new SetBucketPolicyRequest(bucketName, policyPublicReadOnly);
-        s3Client.setBucketPolicy(setBucketPolicyRequest);
+        // logger.info("Setting public read only bucket policy");
+        // String policyPublicReadOnly = "{ \"Statement\": [ { \"Effect\": \"Allow\",
+        // \"Principal\": \"*\", \"Action\": [ \"s3:GetObject\", \"s3:ListBucket\" ],
+        // \"Resource\": [ \"urn:sgws:s3:::website-bucket\",
+        // \"urn:sgws:s3:::website-bucket/*\" ] } ] }";
+        // SetBucketPolicyRequest setBucketPolicyRequest = new
+        // SetBucketPolicyRequest(bucketName, policyPublicReadOnly);
+        // s3Client.setBucketPolicy(setBucketPolicyRequest);
 
+        DeleteBucketRequest deleteBucketRequest = new DeleteBucketRequest(bucketName);
         logger.info("Delete bucket " + bucketName);
-        s3Client.deleteBucket(bucketName);
+        s3Client.deleteBucket(deleteBucketRequest);
 
         logger.info("Finished");
     }
@@ -366,27 +351,5 @@ public final class S3 {
 
         // shutdown S3 Client
         s3Client.shutdown();
-    }
-
-    /**
-     * Creates a sample file of size sizeInMb. If tempFileDirectory is not empty the
-     * file will be created in tempFileDirectory, otherwise in the default temp
-     * directory of the OS.
-     *
-     * @param sizeInMb              File size
-     * @param tempFileDirectoryPath Optional directory to be used for storing
-     *                              temporary file
-     * @return A newly created temporary file of size sizeInMb
-     * @throws IOException
-     */
-    private File createFile(final long sizeInMb, final Path tempFileDirectoryPath) throws IOException {
-        logger.info("Creating temporary file");
-        Path tempFile = Files.createTempFile(tempFileDirectoryPath, "s3-sample-file-", ".dat");
-        logger.info("Created temporary file " + tempFile);
-        RandomAccessFile randomAccessFile = new RandomAccessFile(tempFile.toFile(), "rw");
-        randomAccessFile.setLength(sizeInMb * MB);
-        randomAccessFile.close();
-
-        return tempFile.toFile();
     }
 }
